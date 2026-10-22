@@ -46,6 +46,7 @@ ap.add_argument("--lam_tc", type=float, default=0.3, help="weight of thermal ter
 ap.add_argument("--lam_night", type=float, default=0.2, help="weight of the real-night self-supervised block")
 ap.add_argument("--w_in", type=float, default=1.0); ap.add_argument("--w_struct", type=float, default=1.0)
 ap.add_argument("--w_pres", type=float, default=1.0); ap.add_argument("--pres_cap", type=float, default=0.35)
+ap.add_argument("--pres_lum", type=int, default=1, help="1 (v13.2): object-presence term on luminance only (colour version painted LLVIP pedestrians blue)")
 ap.add_argument("--night_every", type=int, default=2); ap.add_argument("--night_bs", type=int, default=2)
 ap.add_argument("--night_t", default="150,400", help="t range where the night x0 estimate is taken")
 ap.add_argument("--night_sigma_cap", type=float, default=0.06, help="noise-estimate cap for the night q map (0.02 in the first run let sensor noise count as texture, so L_in taught the model to copy noise)")
@@ -71,6 +72,7 @@ if a.smoke:
 
 from trg13 import paths, data as DT, maps as MP, losses as LS, metrics as ME, sampler as SM
 from trg13 import model as MD
+LS.PRES_LUM_ONLY = bool(a.pres_lum)
 
 P = paths.resolve()
 for k in ("MSRS", "CKPT"):
@@ -134,7 +136,7 @@ log(f"MSRS train {len(tr_names)} / val {len(val_ms)} | night pool {len(night_tr)
 # ------------------------------------------------------------------------------------------------ calibration
 STATE = f"{OUT}/state.json"
 state = json.load(open(STATE)) if os.path.exists(STATE) else {}
-if "calib" not in state:
+if "calib" not in state or state.get("calib_pres_lum") != a.pres_lum:
     gts, irs = [], []
     cal_ds = DT.MSRSPairs(P["MSRS"], "train", names=tr_names[::max(1, len(tr_names) // 64)][:64], train=False, seed_base=60000)
     for i in range(0, len(cal_ds), 8):
@@ -145,6 +147,7 @@ if "calib" not in state:
     if not all(np.isfinite(v) for v in state["calib"].values()):
         state["calib"] = dict(tau_struct=0.35, tau_pres=0.08)
     del gts, irs
+state["calib_pres_lum"] = a.pres_lum
 calib = state["calib"]
 log(f"calibrated natural thermal-consistency levels on MSRS GT: {calib}")
 json.dump(dict(vars(a), calib=calib, paths=P), open(f"{OUT}/config.json", "w"), indent=1)
@@ -187,7 +190,8 @@ def evaluate(step):
     nm = lambda rows, k: float(np.nanmean([r.get(k, np.nan) for r in rows])) if rows else float("nan")
     res = dict(step=step, psnr=nm(fr, "psnr"), ssim=nm(fr, "ssim"), lpips=nm(fr, "lpips"), psnr_hot=nm(fr, "psnr_hot"),
                tsc_gap=nm(fr, "tsc_gap"), obj_ratio=nm(fr, "obj_ratio"),
-               n_tsc=nm(nr, "tsc"), n_tes=nm(nr, "tes"), n_obj=nm(nr, "obj"), n_fid=nm(nr, "in_fid"), n_hf=nm(nr, "hf"))
+               n_tsc=nm(nr, "tsc"), n_tes=nm(nr, "tes"), n_obj=nm(nr, "obj_L"), n_obj_lab=nm(nr, "obj"), n_obj_ab=nm(nr, "obj_ab"),
+               n_fid=nm(nr, "in_fid"), n_hf=nm(nr, "hf"), obj_ab=nm(fr, "obj_ab"), obj_ab_gt=nm(fr, "obj_ab_gt"))
     for sev in range(3):
         sel = [r for r, j in zip(fr, range(len(fr))) if j % 3 == sev]
         res[f"psnr_{sev_cycle[sev]}"] = nm(sel, "psnr")

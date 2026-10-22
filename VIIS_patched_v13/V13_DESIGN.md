@@ -111,3 +111,21 @@ Score = `SSIM + PSNR/50 - LPIPS - 0.5 * TSC_gap`. A checkpoint is flagged if the
 - **Eligibility:** a checkpoint qualifies only if MSRS-test-validation PSNR >= step-0 PSNR - 2 dB (`--msrs_tol`).
 - **Score among eligible checkpoints:** night input fidelity + night thermal structure + 0.02 x night object separation + 0.5 x the MSRS score.
 - **Texture guard:** raised to 3.0x, because VIIS is over-smooth on LLVIP (BRISQUE 0.4, below the raw input's 11), so 1.5-2.2x more texture is real detail.
+
+## 7. v13.1 results and the v13.2 change
+
+**v13.1 results (official test splits, paired against VIIS zero-shot):**
+- **MSRS** (scored against the real day images): PSNR 21.92 dB vs 18.45 dB; better at every severity (light 24.9 vs 19.5, low 21.4 vs 18.4, dark 19.4 vs 17.5).
+- **LLVIP + MSRS night:**
+  - input fidelity: 0.858 vs 0.671;
+  - YOLO person recall: 0.50 vs 0.22;
+  - unsupported texture: lower than VIIS (0.0051 vs 0.0067), so no hallucinated texture.
+
+**Artifact found in the grids:** with the thermal-consistency terms on, pedestrians on sodium-lit LLVIP frames turn **blue or purple**. On LLVIP outputs, 3.9% of pixels are strongly blue, against 1.0% without the thermal terms and 1.7% in the input; purple pixels are 0.57% against about 0%. MSRS shows no such shift.
+
+**Cause:** `L_pres` measured object/ring separation in full L\*a\*b\*. Against yellow ground, the cheapest way to separate a dark pedestrian is to move it towards blue on the b\* axis. This also inflated the colour-based object metrics (`nr_obj` 12.96, `nr_box` 15.66).
+
+**v13.2:**
+- `L_pres` and its calibration use **L\* only** (`--pres_lum 1`). Thermal evidence says *where* an object is, not *what colour* it is.
+- New metrics separate the two effects. `obj_L` / `box_L` measure brightness separation. `obj_ab` measures colour separation, to be compared with the input or ground-truth row; much higher means invented colour.
+- Checkpoint selection uses `obj_L`.

@@ -81,7 +81,9 @@ def lab(x01):
     return cv2.cvtColor(np.clip(x01, 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)   # L 0..100, a/b ~ -128..127
 
 
-def object_contrast(out01, th01, ring=15):
+def object_contrast(out01, th01, ring=15, part="lab"):
+    """Separation of hot objects from their surrounding ring. part: 'lab' (all of L*a*b*), 'L' (brightness only) or
+    'ab' (colour only). A large 'ab' value that the input / ground truth do not have = invented colour (v13.1 artifact)."""
     s = thermal_saliency_np(th01)
     obj = s > 0.5
     if obj.sum() < 30:
@@ -90,13 +92,15 @@ def object_contrast(out01, th01, ring=15):
     if rg.sum() < 30:
         return float("nan")
     L = lab(out01)
-    return float(np.linalg.norm(L[obj].mean(0) - L[rg].mean(0)))
+    sl = {"lab": slice(0, 3), "L": slice(0, 1), "ab": slice(1, 3)}[part]
+    return float(np.linalg.norm(L[obj][:, sl].mean(0) - L[rg][:, sl].mean(0)))
 
 
-def box_contrast(out01, boxes, margin=8):
+def box_contrast(out01, boxes, margin=8, part="lab"):
     if not boxes:
         return float("nan")
-    L = lab(out01); H, W = L.shape[:2]; vals = []
+    sl = {"lab": slice(0, 3), "L": slice(0, 1), "ab": slice(1, 3)}[part]
+    L = lab(out01)[..., sl]; H, W = L.shape[:2]; vals = []
     for x1, y1, x2, y2 in boxes:
         x1, y1, x2, y2 = int(max(0, x1)), int(max(0, y1)), int(min(W, x2)), int(min(H, y2))
         if x2 - x1 < 3 or y2 - y1 < 3:
@@ -105,7 +109,7 @@ def box_contrast(out01, boxes, margin=8):
         m = np.ones((Y2 - Y1, X2 - X1), bool); m[y1 - Y1:y2 - Y1, x1 - X1:x2 - X1] = False
         if m.sum() < 10:
             continue
-        vals.append(np.linalg.norm(L[y1:y2, x1:x2].reshape(-1, 3).mean(0) - L[Y1:Y2, X1:X2][m].mean(0)))
+        vals.append(np.linalg.norm(L[y1:y2, x1:x2].reshape(-1, L.shape[-1]).mean(0) - L[Y1:Y2, X1:X2][m].mean(0)))
     return float(np.mean(vals)) if vals else float("nan")
 
 
@@ -160,7 +164,8 @@ def entropy(x01):
 
 def no_ref_all(out01, in01, th01, boxes=None):
     return dict(tsc=tsc(out01, th01), tes=thermal_edge_score(out01, th01), obj=object_contrast(out01, th01),
-                box=box_contrast(out01, boxes or []), in_fid=input_fidelity(out01, in01), hf=hf_energy(out01, in01, th01),
+                obj_L=object_contrast(out01, th01, part="L"), obj_ab=object_contrast(out01, th01, part="ab"),
+                box=box_contrast(out01, boxes or []), box_L=box_contrast(out01, boxes or [], part="L"), in_fid=input_fidelity(out01, in01), hf=hf_energy(out01, in01, th01),
                 color=colorfulness(out01), entropy=entropy(out01), mean_l=float(luma(out01).mean()))
 
 
@@ -172,6 +177,8 @@ def full_ref_all(out01, gt01, in01, th01, lpips_fn=None):
     r.update(tsc=t_out, tsc_gt=t_gt, tsc_gap=abs(t_out - t_gt) if np.isfinite(t_out) and np.isfinite(t_gt) else float("nan"))
     o, og = object_contrast(out01, th01), object_contrast(gt01, th01)
     r.update(obj=o, obj_gt=og, obj_ratio=o / og if np.isfinite(o) and np.isfinite(og) and og > 1e-3 else float("nan"))
+    oa, oag = object_contrast(out01, th01, part="ab"), object_contrast(gt01, th01, part="ab")
+    r.update(obj_ab=oa, obj_ab_gt=oag)
     if lpips_fn is not None:
         r["lpips"] = float(lpips_fn(out01, gt01))
     return r

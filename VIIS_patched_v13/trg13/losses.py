@@ -23,7 +23,6 @@ import torch.nn.functional as F
 from .maps import luminance, blur, gauss, odd, smoothstep, thermal_saliency, thermal_structure_conf
 
 
-# right now uses colours, separate colour from brightness and achieve v13_no_cc output
 def wmean(d, w, frac=1e-3):
     """per-image weighted mean, averaged over the batch; images with ~no weight shrink to 0 instead of exploding."""
     den = w.sum([1, 2, 3]) + frac * w.shape[-2] * w.shape[-1]
@@ -79,11 +78,20 @@ def thermal_struct_loss(img, ir, w, tau):
     return wmean(F.relu(tau - r), w)
 
 
-def object_contrast_map(img, s, k_ctx=None, ring=None):
-    """Local separation between the hot object (soft mask s) and its surrounding ring, Bx1xHxW (Lab/100 units)."""
+PRES_LUM_ONLY = True   # v13.2: set from train_v13.py --pres_lum
+
+
+def object_contrast_map(img, s, k_ctx=None, ring=None, lum_only=None):
+    """Local separation between the hot object (soft mask s) and its surrounding ring, Bx1xHxW (Lab/100 units).
+    lum_only (default PRES_LUM_ONLY): brightness separation only. With colour included (v13.1) the cheapest way for the
+    model to separate a dark-clothed pedestrian from sodium-yellow ground was to paint the pedestrian BLUE (opposite of
+    yellow on the b* axis): 3.9% strongly-blue pixels on LLVIP vs 1.0% without the term. Thermal evidence says WHERE an
+    object is, not what colour it has, so the presence term now acts on L* only."""
     k_ctx = k_ctx or 31
     ring = ring or 15
     lab = rgb_to_lab01(img)
+    if (PRES_LUM_ONLY if lum_only is None else lum_only):
+        lab = lab[:, :1]
     M = s
     R = (F.max_pool2d(s, ring, 1, ring // 2) - s).clamp(0, 1) * (s < 0.1).float()
     bm, br = blur(M, k_ctx), blur(R, k_ctx)

@@ -191,7 +191,7 @@ keys = sorted({k for r in rows for k in r})
 with open(f"{a.out}/metrics.csv", "w", newline="") as f:
     w = csv.DictWriter(f, fieldnames=keys); w.writeheader(); [w.writerow(r) for r in rows]
 
-HIGHER = {"psnr", "ssim", "psnr_hot", "nr_tsc", "nr_tes", "nr_obj", "nr_box", "nr_in_fid", "yolo_recall", "nr_entropy"}
+HIGHER = {"psnr", "ssim", "psnr_hot", "nr_tsc", "nr_tes", "nr_obj", "nr_box", "nr_obj_L", "nr_box_L", "nr_in_fid", "yolo_recall", "nr_entropy"}
 LOWER = {"lpips", "tsc_gap", "nr_hf", "brisque"}
 def summarise(group_fn):
     out = {}
@@ -274,15 +274,15 @@ rep = [f"# v13 evaluation\n\nsteps={a.steps} eta={a.eta} guid={a.guid} long_side
        "image|), hf (texture in regions neither modality supports), brisque. For tsc / obj, MORE is not automatically better: "
        "compare with the gt row (natural level)."]
 if "msrs_syn" in items:
-    rep.append(table("msrs_syn", ["psnr", "ssim", "lpips", "psnr_hot", "tsc", "tsc_gap", "obj_ratio"], "MSRS test, synthetic degradation (full reference)"))
+    rep.append(table("msrs_syn", ["psnr", "ssim", "lpips", "psnr_hot", "tsc", "tsc_gap", "obj_ratio", "obj_ab"], "MSRS test, synthetic degradation (full reference; obj_ab = colour-only object separation, compare with the gt row)"))
     for sev in ("light", "low", "dark"):
         ln = [f"\n**{sev}**: " + ", ".join(f"{m} {summary['by_severity'].get(f'msrs_syn|{sev}|{m}', {}).get('psnr', float('nan')):.2f} dB / "
                                            f"{summary['by_severity'].get(f'msrs_syn|{sev}|{m}', {}).get('ssim', float('nan')):.3f}" for m in methods)]
         rep += ln
 if "real" in items:
-    rep.append(table("real", ["nr_tsc", "nr_tes", "nr_obj", "nr_box", "yolo_recall", "nr_in_fid", "nr_hf", "brisque"], "Real night (LLVIP test + MSRS test night), no reference"))
+    rep.append(table("real", ["nr_tsc", "nr_tes", "nr_obj_L", "nr_box_L", "nr_obj_ab", "yolo_recall", "nr_in_fid", "nr_hf", "brisque"], "Real night (LLVIP test + MSRS test night), no reference (obj_L/box_L = brightness separation; obj_ab = colour separation, compare with the input row: much higher = invented colour)"))
 if "bins" in items:
-    rep.append(table("bins", ["nr_tsc", "nr_obj", "nr_in_fid", "nr_hf", "brisque"], "Real light / low-light / dark samples"))
+    rep.append(table("bins", ["nr_tsc", "nr_obj_L", "nr_obj_ab", "nr_in_fid", "nr_hf", "brisque"], "Real light / low-light / dark samples"))
 if paired:
     rep.append("\n### Paired per-image comparison vs VIIS zero-shot (win rate, Wilcoxon p)\n")
     rep += [f"- {k}: model {v['mean_model']:.4g} vs VIIS {v['mean_viis']:.4g}, win {100 * v['win_rate']:.0f}% (n={v['n']}, p={v['p']:.3g})"
