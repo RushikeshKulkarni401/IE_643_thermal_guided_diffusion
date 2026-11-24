@@ -1,150 +1,188 @@
-# VIIS_patched_v13 (v13.1): Thermal-RGB guided diffusion (TRG-Diffusion v13)
+# TRG-Diffusion (`VIIS_patched_v13`): Thermal–RGB Guided Diffusion for Consistent Visible Image Reconstruction
 
-**v13.1:** trajectory loss against real GT (fixes the exposure drift), validation moved to unseen MSRS-test images, checkpoints selected LLVIP-first. Commit-mode cell: `kaggle_commit_v13_1.py`. Rationale: section 6 of `V13_DESIGN.md`.
+**TRG-Diffusion** fine-tunes the pretrained **VIIS** latent diffusion model to reconstruct clear, natural-colour visible images from severely degraded low-light RGB frames and paired thermal (infrared) imagery.
 
-Fine-tunes pretrained **VIIS** so that, given a degraded RGB frame and its thermal frame, it reconstructs an enhanced visible image that preserves thermal-supported objects and boundaries.
-- The **only** reconstruction target is real MSRS day images.
-- **No VIIS zero-shot output, sharpened or not, is used anywhere as a target.**
-- Why previous versions failed and how v13 fixes it: `V13_DESIGN.md`.
+- **Live App:** [Gradio](https://dub.sh/T3425hx)
+- **Demo Video:** [Drive](https://drive.google.com/file/d/1y-uVw2g_ighV7MXXE5AZgbtCLbj2as62/view?usp=sharing)
+- **Report & Presentation:** [Drive](https://drive.google.com/drive/folders/1x6mmSphOa7ffEzrKczLJ9CdI4R-susJx)
+- **How to run on Kaggle:** `README_v13.md`, or `kaggle_v13.ipynb` (and commit-mode script `kaggle_commit_v13_1.py`)
+- **Why v3 to v12 failed and how v13.2 works:** `V13_DESIGN.md`
+
+## Overview & Key Contributions
+
+At night, visible RGB frames suffer from extreme darkness, sensor noise, colour casts, fog, and lamp glare, whereas thermal frames reliably reveal warm objects (pedestrians, vehicles) regardless of lighting but lack colour and fine texture. Naive fusion or zero-shot pretrained VIIS often produces hazy outputs, global exposure drift, or grey/tinted pedestrians.
+
+TRG-Diffusion solves this through four core design principles:
+
+1. **Real Daytime Ground Truth Only:** Only real daytime images (from MSRS) are used as reconstruction targets, paired with a physically motivated linear-light night degradation pipeline (exposure drops, sodium/LED lamp pools, colour casts, fog, glare, sensor noise, JPEG artefacts) and ECC thermal–RGB alignment. **No zero-shot VIIS output is ever used as a target.**
+
+2. **Zero-Initialised Thermal Prior Adapter (TPA):** A lightweight adapter (\~2.9M parameters) initialised at zero (following ControlNet) injects thermal saliency ($s$) and visible quality ($q$) maps into the frozen UNet input blocks, preserving pretrained VIIS priors at step 0 while progressively learning thermal-guided structural cues.
+
+3. **Trajectory Loss Against Exposure Bias:** A $\sqrt{\text{SNR}}$-weighted trajectory L1 loss ($\mathcal{L}_{traj}$) supervises the model's own multi-step DDIM denoising trajectory against real daytime ground truth, eliminating darkening drift during sampling.
+
+4. **Luminance-Only Thermal Consistency (`pres_lum`):** Bounded self-supervised consistency losses on real night frames (MSRS-night and LLVIP) enforce thermal–visible structural correlation ($\mathcal{L}_{struct}$) and hot-object vs. background ring contrast ($\mathcal{L}_{pres}^{lum}$) strictly in **Rec.601 luminance (**$Y$**)** rather than CIELAB chrominance ($a^*, b^*$), preventing blue/purple colour casts on night pedestrians while preserving sharp thermal boundaries.
+
+## Repository Structure
 
 ```
-train_v13.py          training (MSRS GT + bounded real-night consistency), validation, checkpoint selection
-infer_v13.py          inference + evaluation: MSRS (light/low/dark, full reference), MSRS-night, LLVIP, light/low/dark samples, user pairs
-align_audit_v13.py    RGB-thermal registration audit (deliverable 1)
-run_all_v13.sh        everything in one go (2 GPUs: full model + ablation, then evaluation and audit)
-kaggle_v13.ipynb      the same as notebook cells
-trg13/                degrade.py, align.py, data.py, maps.py, losses.py, model.py (adapter), sampler.py (tiled DDIM), metrics.py, paths.py
-tests/                test_v13_numpy.py (CPU, runs anywhere), smoke_kaggle.sh (GPU, 5-10 min, every torch path)
-ldm/ taming/ informationSynthesis/   VIIS code with the earlier Kaggle patches (pure-PyTorch deformable attention, taming stub,
-                      checkpoint-backward fix, yaml ckpt_path null). The old v2-v12 experiment scripts were removed on purpose.
+train_v13.py          Training loop (MSRS supervised + bounded real-night consistency), validation, and checkpoint selection
+infer_v13.py          Tiled full-frame DDIM inference and benchmark evaluation across MSRS, LLVIP, brightness bins, and custom pairs
+align_audit_v13.py    RGB–thermal ECC registration audit across datasets
+slim_ckpt_v13.py      Converts the 9 GB pretrained VIIS last.ckpt into a fast-loading ~2.5 GB EMA-folded viis_slim.ckpt
+run_all_v13.sh        End-to-end automated pipeline (2 GPUs: full model + ablation training, evaluation, and alignment audit)
+kaggle_v13.ipynb      Interactive Kaggle notebook covering setup, checks, training, evaluation, and packaging
+trg13/                Core library:
+                        degrade.py  - Linear-light physical night degradation synthesis
+                        align.py    - ECC parametric thermal-to-RGB registration
+                        data.py     - Leak-free MSRS & LLVIP dataset loaders and brightness binning
+                        maps.py     - Thermal saliency (s), visible quality (q), and edge maps
+                        losses.py   - Trajectory loss, luminance-only presence loss (pres_lum), structural & night fidelity losses
+                        model.py    - VIIS backbone wrapper, Thermal Prior Adapter, EMA scope, checkpoint I/O
+                        sampler.py  - Full-frame tiled DDIM sampler with classifier-free thermal guidance
+                        metrics.py  - Full-reference (PSNR, SSIM, LPIPS, PSNR-hot) and no-reference / YOLOv8n detection metrics
+                        paths.py    - Automatic dataset and checkpoint path resolution
+tests/                test_v13_numpy.py (CPU unit tests) and smoke_kaggle.sh (end-to-end GPU smoke test)
+ldm/ taming/ informationSynthesis/   Patched VIIS latent diffusion codebase (pure-PyTorch deformable attention, taming stub,
+                      gradient-checkpointing fix, null yaml ckpt_path)
 ```
 
-## Kaggle: step by step
+## Datasets
 
-### 0. One-time preparation
-1. Upload **VIIS_patched_v13.zip** as a new Kaggle Dataset (*Datasets -> New Dataset -> upload the zip*, e.g. name it `viis-patched-v13`). Kaggle extracts it automatically.
-2. Create a notebook and set **Accelerator = GPU T4 x2**, **Internet = On** (needed for `pip install lpips piq ultralytics` and the LPIPS/VGG weights).
-3. **Add Input** for these four datasets (the same ones you used before):
+| Dataset | Content | Split & Usage | 
+| ----- | ----- | ----- | 
+| **MSRS** | Paired daytime & nighttime road scenes (RGB + IR, $640 \times 480$) | **536 train day images** serve as the sole real ground truth (synthetically degraded on the fly). Train night frames enter the real-night consistency pool; **MSRS test** is held out for validation and full-reference evaluation. | 
+| **LLVIP** | Paired nighttime street scenes (RGB + IR, $1280 \times 1024$) with pedestrian bounding boxes | Up to **6,000 train frames** enter the real-night consistency pool (no ground truth). **LLVIP test** frames are used for no-reference evaluation, colour-cast auditing, and YOLOv8n person recall. | 
+| **VIIS Pretrained** | Pretrained VIIS checkpoint (`last.ckpt`, \~9 GB) | Provides the VQ-f4 autoencoder and latent diffusion UNet backbone. | 
 
-   | dataset | content |
-   |---|---|
-   | `elixir4o4/viis-master` | VIIS `last.ckpt` (9 GB) |
-   | `elixir4o4/msrs-main` | MSRS (`train/vi`, `train/ir`, `test/vi`, `test/ir`) |
-   | `afradhossain/llvip-dataset` | LLVIP (`visible/{train,test}`, `infrared/{train,test}`, `Annotations`) |
-   | `viis-patched-v13` | this code |
+## Step-by-Step Guide (Kaggle)
 
-   Paths are found automatically. To override, set env vars `MSRS`, `LLVIP`, `VIIS_CKPT`, `RUNS` before running.
-4. Upload `kaggle_v13.ipynb` (*File -> Import Notebook*), or paste the commands below into cells.
+### 0. One-Time Preparation
 
-### 1. Setup (run again after every session restart)
+1. Upload this repository as a Kaggle Dataset (e.g. `viis-patched-v13`).
+
+2. Create a Kaggle Notebook with **Accelerator = GPU T4 x2** and **Internet = On** (required for installing `lpips`, `piq`, `ultralytics`, `gradio`, and downloading pretrained VGG/YOLO weights).
+
+3. Attach the following four Kaggle Datasets via **Add Input**:
+
+   * `elixir4o4/viis-master` (pretrained VIIS `last.ckpt`)
+
+   * `elixir4o4/msrs-main` (MSRS dataset)
+
+   * `afradhossain/llvip-dataset` (LLVIP dataset)
+
+   * `viis-patched-v13` (this codebase)
+
+   *(Paths are resolved automatically by `trg13/paths.py`. To override manually, set environment variables `MSRS`, `LLVIP`, `VIIS_CKPT`, or `RUNS`.)*
+
+### 1. Environment Setup
+
+Run at the start of each interactive Kaggle session:
+
 ```python
 import glob, os, shutil, subprocess, sys
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "einops", "omegaconf", "kornia", "lpips", "piq", "ultralytics"])
-try: import pytorch_lightning
-except ImportError: subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pytorch-lightning"])
+try:
+    import pytorch_lightning
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pytorch-lightning"])
 src = [os.path.dirname(p) for k in range(1, 5) for p in glob.glob("/kaggle/input/" + "*/" * k + "train_v13.py")][0]
-shutil.rmtree("/kaggle/working/VIIS13", ignore_errors=True); shutil.copytree(src, "/kaggle/working/VIIS13")
+shutil.rmtree("/kaggle/working/VIIS13", ignore_errors=True)
+shutil.copytree(src, "/kaggle/working/VIIS13")
 os.chdir("/kaggle/working/VIIS13")
 ```
 
-### 2. Checks (1 min)
+### 2. Sanity Checks & Checkpoint Conversion
+
 ```bash
-python tests/test_v13_numpy.py      # degradation, ECC alignment, metric non-gameability, leak-free splits
-python -m trg13.paths               # every line must say OK
+# 1. Verify degradation physics, ECC alignment, metric non-gameability, and split isolation
+python tests/test_v13_numpy.py
+python -m trg13.paths
+
+# 2. Convert 9 GB last.ckpt -> ~2.5 GB EMA-folded viis_slim.ckpt for fast loading (2-5 min)
+python slim_ckpt_v13.py
 ```
 
-### 2b. One-time checkpoint conversion (2-5 min)
-```bash
-python slim_ckpt_v13.py     # 9 GB last.ckpt on /kaggle/input -> /kaggle/working/viis_slim.ckpt (~2.5 GB, EMA weights folded in)
-```
-Every later load (smoke test, both trainings, inference) then takes seconds instead of 20+ minutes. Loading the 9 GB file
-memory-mapped from Kaggle's network-mounted input storage is very slow. The smoke test and `run_all_v13.sh` do this step
-automatically if the file is missing; it is lost when the session ends (re-run it, or save it as a Kaggle dataset).
+### 3. GPU Smoke Test (5–10 min)
 
-### 3. Smoke test (5-10 min): do not skip
 ```bash
-bash tests/smoke_kaggle.sh          # must end with "SMOKE TEST PASSED"
+bash tests/smoke_kaggle.sh
 ```
-It builds the model plus adapter and calibrates. It then runs a step-0 evaluation, 4 training steps on the MSRS and night branches, and 2 evaluations, and saves and loads checkpoints. Finally it does tiled full-frame inference with all metrics, grids and the report. If it fails, send me the traceback: the torch code was written without a GPU.
 
-### 4. Train (about 2-3 h on two T4s in parallel)
-Interactive (notebook cell 4a), on both GPUs:
+Builds the model and adapter, calibrates luminance contrast thresholds on MSRS ground truth, runs step-0 validation, executes 4 training steps across MSRS and real-night branches, tests checkpoint saving/loading, and runs tiled full-frame inference. Verify that it finishes with `SMOKE TEST PASSED`.
+
+### 4. Training (\~2–3 hours on 2x T4)
+
+Launch the full model (`v13_2_full`) and the thermal-loss ablation (`v13_no_tc`) in parallel across the two T4 GPUs:
+
 ```bash
 mkdir -p /kaggle/working/runs
-CUDA_VISIBLE_DEVICES=0 nohup python -u train_v13.py --name v13_full > /kaggle/working/runs/v13_full.log 2>&1 &
+CUDA_VISIBLE_DEVICES=0 nohup python -u train_v13.py --name v13_2_full > /kaggle/working/runs/v13_2_full.log 2>&1 &
 sleep 90
 CUDA_VISIBLE_DEVICES=1 nohup python -u train_v13.py --name v13_no_tc --thermal_loss 0 > /kaggle/working/runs/v13_no_tc.log 2>&1 &
 ```
-- `v13_full` is the project model.
-- `v13_no_tc` is the ablation: identical except the thermal-consistency terms. It shows what the thermal loss contributes.
-- With one GPU, run them one after the other.
 
-Unattended alternative: `bash run_all_v13.sh` in a single cell, then *Save Version -> Save & Run All (Commit)*. This trains both runs, evaluates and audits; the session limit is 12 h.
+* **Single GPU:** Run the two commands sequentially.
 
-Monitor:
+* **Unattended Commit Run:** Run `bash run_all_v13.sh` in a single cell and select *Save Version -> Save & Run All (Commit)*.
+
+* **Resuming:** Training automatically resumes from `latest.pt` if re-run with the same `--name`.
+
+Monitor validation progress:
+
 ```bash
-grep -E "EVAL|NEW BEST|STOP|DONE" /kaggle/working/runs/v13_full.log | tail
+grep -E "EVAL|NEW BEST|STOP|DONE" /kaggle/working/runs/v13_2_full.log | tail
 ```
 
-The training is resumable: re-running the same command continues from `latest.pt`.
+#### Reading `EVAL` Logs (every 250 steps, EMA weights)
 
-**Reading `EVAL` lines** (every 250 steps, EMA weights). Step 0 is pretrained VIIS, because the adapter starts at zero.
+Step 0 corresponds to zero-shot pretrained VIIS because the Thermal Prior Adapter is zero-initialised.
 
-| field | meaning | healthy |
-|---|---|---|
-| `psnr`, `ssim`, `lpips`, `psnr_hot` | MSRS validation vs the **real** day image (light/low/dark mix) | rise above the step-0 values, then flatten |
-| `psnr_dark` / `psnr_low` / `psnr_light` | per severity | `light` must not drop: good RGB must be left alone |
-| `tsc_gap`, `obj_ratio` | thermal consistency / object separation vs the GT's own level | gap falls; ratio approaches 1 |
-| `n_tsc`, `n_obj`, `n_fid`, `n_hf` | night validation (no GT) | `n_hf`/step-0 below 1.6 (`hf_ratio`); `fid_drop` below 0.08 |
-| `flag` | hallucination guard tripped | false |
+| Field | Meaning | Target Behaviour | 
+| ----- | ----- | ----- | 
+| `psnr`, `ssim`, `lpips`, `psnr_hot` | MSRS validation metrics vs. real daytime ground truth (light/low/dark mix) | Improve over step-0 VIIS and stabilise | 
+| `psnr_dark`, `psnr_low`, `psnr_light` | PSNR broken down by degradation severity | `psnr_light` remains high (already-well-lit images are not over-processed) | 
+| `tsc_gap`, `obj_ratio` | Thermal consistency gap and luminance object separation ($L^*$) relative to ground truth | `tsc_gap` decreases; `obj_ratio` approaches `1.0` | 
+| `n_tsc`, `n_obj`, `n_fid`, `n_hf` | Real-night validation metrics (no ground truth) | `hf_ratio` (`n_hf` / step-0) $< 1.6$; `fid_drop` $< 0.08$ | 
+| `flag` | Hallucination / over-sharpening guard | `False` (`best.pt` is selected only from unflagged checkpoints) | 
 
-`best.pt` is the best score (`ssim + psnr/50 - lpips - 0.5*tsc_gap`) among unflagged evaluations.
+### 5. Evaluation, Alignment Audit & Interactive Demo
 
-### 5. Inference and evaluation (30-60 min)
 ```bash
-python -u infer_v13.py --ckpts /kaggle/working/runs/v13_no_tc/best.pt,/kaggle/working/runs/v13_full/best.pt \
-       --labels v13_no_tc,v13 --out /kaggle/working/infer_v13
+# Full benchmark evaluation across MSRS, LLVIP, and brightness bins
+python -u infer_v13.py \
+  --ckpts /kaggle/working/runs/v13_no_tc/best.pt,/kaggle/working/runs/v13_2_full/best.pt \
+  --labels v13_no_tc,v13_2 \
+  --out /kaggle/working/infer_v13_2
+
+# RGB-thermal ECC registration audit
 python align_audit_v13.py --out /kaggle/working/align_audit
 ```
 
-**What it runs on:**
-- **MSRS test:** 30 day images degraded at three fixed severities (**light / low-light / dark**). This gives full-reference PSNR/SSIM/LPIPS against the real day image.
-- **MSRS test night + LLVIP test:** real night, full frames, tiled sampling at long side 512. Uses thermal and object metrics, LLVIP person boxes and YOLO recall.
-- **Real test frames binned by brightness** into **light / low-light / dark** (`--k_bins` per bin).
-- **Your own pairs (optional):** `--samples_dir /kaggle/input/<ds>/mypairs` with `rgb/` and `ir/` folders. Pairs are ECC-aligned automatically (`--align 1`).
+**Evaluation Suites & Outputs (`--out`):**
 
-**Methods compared:** input, CLAHE, **VIIS zero-shot** (pretrained), `v13_no_tc`, `v13`.
+* **Synthetic MSRS Test:** Full-reference PSNR, SSIM, LPIPS, and hot-region PSNR across `light`, `low`, and `dark` severities.
 
-**Outputs** (in `--out`):
-- `report.md`: tables plus per-image paired win rate and Wilcoxon p versus VIIS zero-shot;
-- `summary.json`, `metrics.csv`;
-- `grid_msrs_{light,low,dark}.png`, `grid_llvip.png`, `grid_msrs_night.png`, `grid_bin_{light,low,dark}.png`, `grid_user.png`;
-- every output image in `<set>/<method>/`.
+* **Real Night (MSRS-night & LLVIP-test):** Full-frame tiled DDIM reconstruction (`long_side=512`), thermal structural consistency, input fidelity, colour-cast checks, and YOLOv8n person detection recall.
 
-**Options:**
-- `--guid 1.5` turns on trained thermal guidance (stronger hot objects; check `nr_hf` and PSNR);
-- `--long_side 640` gives larger full frames (slower);
-- `--steps 50` gives more DDIM steps;
-- `--sets real,bins` runs a subset.
+* **Brightness Bins & Custom Pairs:** Stratified evaluation by input luminance (`--k_bins`), plus optional custom RGB/IR pairs via `--samples_dir <path>` (with `rgb/` and `ir/` subdirectories).
 
-### 6. Download
-Notebook cell 8 zips `infer_v13/`, `align_audit/` and the run logs and previews without checkpoints. `best.pt` is about 0.6 GB per run; download it separately if you want to keep the model.
+* **Generated Artefacts:** `report.md` (with paired win rates and Wilcoxon signed-rank $p$-values against zero-shot VIIS), `summary.json`, `metrics.csv`, comparison grids (`grid_*.png`), and individual reconstructed frames.
 
-## Main hyper-parameters (all CLI flags of `train_v13.py`)
-| flag | default | why |
-|---|---|---|
-| `--mode` | `attn_out` | Both cross-attentions + out conv + last 3 output blocks + adapter (about 74M + 2M). Global tone and detail can move. `attn2` = thermal attention only (smaller, safer). |
-| `--lr`, `--lr_tpa`, `--steps`, `--warmup` | 1e-5, 3e-5, 3000, 200 | Pretrained weights / new adapter. Cosine decay to 10%, early stopping on validation. VIIS is very sensitive to Adam's first sign-like steps (4 un-warmed steps at 2e-5 already destroyed it in the smoke test), so keep the warm-up. |
-| `--bs`, `--n_img`, `--t_img` | 3, 2, 300 | MSRS batch. 2 low-t samples per step get image-space losses on the decoded x0. |
-| `--w_l1 --w_ssim --w_lp --hot_w` | 0.5, 0.5, 0.2, 3 | Supervised image terms; hot regions weighted x4. |
-| `--lam_tc` | 0.3 | Thermal terms on MSRS. Target = the GT's own level, so the fixed point is the GT. |
-| `--lam_night`, `--night_every`, `--night_t` | 0.2, 2, 150-400 | Real-night consistency block (no GT). |
-| `--th_drop` | 0.1 | Thermal dropout, which enables `--guid` at inference. |
-| `--thermal_loss 0` | | Ablation run. |
-| `--no_tpa` | | Architecture ablation without the adapter. |
+## Key Hyper-Parameters (`train_v13.py`)
 
-**Tuning (change one thing at a time; resume is automatic only with the same `--name`):**
-- `psnr_dark` gains are small and the loss is still falling: increase `--steps` to 5000, or `--lr` to 1.5e-5 (keep `--warmup 200`).
-- `flag` is true because `hf_ratio` exceeds 1.6 (texture appearing at night): lower `--lam_night` to 0.1, or use `--mode attn`.
-- Hot objects are still faint on LLVIP: set `--lam_tc 0.5`, or use `--guid 1.5` at inference.
-- `psnr_light` drops below step 0: the model over-processes good images. Raise the light share in `trg13/degrade.py` `DEFAULT_MIX`.
+| Flag | Default | Description | 
+| ----- | ----- | ----- | 
+| `--mode` | `attn_out` | Trainable parameters: cross-attention layers + output conv + last 3 decoder blocks + TPA (\~76.7M params). Use `attn` to freeze decoder blocks (\~54M params) or `attn2` for thermal cross-attention only. | 
+| `--lr`, `--lr_tpa` | `1e-5`, `3e-5` | Learning rates for pretrained VIIS layers and the new Thermal Prior Adapter (with cosine decay to 10%). | 
+| `--steps`, `--warmup` | `2500`, `200` | Total training steps and linear warm-up steps (warm-up prevents early Adam step instability in VIIS). | 
+| `--bs`, `--n_img`, `--t_img` | `3`, `2`, `300` | MSRS batch size, number of low-timestep decoded $x_0$ image-loss samples per step, and timestep threshold. | 
+| `--w_l1`, `--w_ssim`, `--w_lp` | `0.5`, `0.5`, `0.2` | Supervised image-space reconstruction weights (hot thermal regions weighted $\times 4$ via `--hot_w 3`). | 
+| `--w_traj` | `1.0` | Weight of the $\sqrt{\text{SNR}}$-weighted DDIM trajectory L1 loss against exposure drift. | 
+| `--lam_tc` | `0.3` | Weight of supervised thermal consistency ($\mathcal{L}_{struct} + \mathcal{L}_{pres}^{lum}$) calibrated to ground-truth luminance contrast. | 
+| `--lam_night`, `--night_every` | `0.2`, `2` | Weight and cadence (every $N$ steps) of bounded real-night self-supervised consistency (`pres_lum` + input luminance fidelity). | 
+| `--th_drop` | `0.1` | Thermal conditioning dropout probability during training, enabling classifier-free thermal guidance (`--guid`) at inference. | 
+| `--thermal_loss` | `1` | Set to `0` to run the `v13_no_tc` ablation without thermal consistency losses. | 
+
+## Acknowledgements
+
+Built upon **VIIS**: *Visible and Infrared Information Synthesis for Severe Low-Light Image Enhancement* (WACV 2025).
